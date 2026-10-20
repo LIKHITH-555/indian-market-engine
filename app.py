@@ -22,9 +22,83 @@ STOCKS_PARQUET = os.path.join(DATA_DIR, "ranked_stocks.parquet")
 @st.cache_data(ttl=600)
 def load_ranked_data():
     con = duckdb.connect()
-    sectors = con.execute(f"SELECT * FROM '{SECTORS_PARQUET}'").df()
-    industries = con.execute(f"SELECT * FROM '{INDUSTRIES_PARQUET}'").df()
-    stocks = con.execute(f"SELECT * FROM '{STOCKS_PARQUET}'").df()
+
+    sectors = con.execute(
+        f"SELECT * FROM '{SECTORS_PARQUET}'"
+    ).df()
+    industries = con.execute(
+        f"SELECT * FROM '{INDUSTRIES_PARQUET}'"
+    ).df()
+    stocks = con.execute(
+        f"SELECT * FROM '{STOCKS_PARQUET}'"
+    ).df()
+
+    required_columns = {
+        "sectors": {
+            "SECTOR",
+            "ROTATION_STAGE",
+            "GROUP_SCORE",
+            "AVG_RET_1M",
+            "AVG_RET_3M",
+            "BREADTH_ABOVE_50DMA",
+            "RS_1M",
+            "RS_3M",
+        },
+        "industries": {
+            "NSE_INDUSTRY",
+            "ROTATION_STAGE",
+            "GROUP_SCORE",
+            "STOCK_COUNT",
+            "AVG_RET_1W",
+            "AVG_RET_1M",
+            "AVG_RET_3M",
+            "BREADTH_ABOVE_50DMA",
+            "AVG_DELIV_SPIKE",
+        },
+        "stocks": {
+            "TRADE_DATE",
+            "SYMBOL",
+            "COMPANY_NAME",
+            "SECTOR",
+            "NSE_INDUSTRY",
+            "SIGNAL",
+            "MASTER_SCORE",
+            "FUND_SCORE",
+            "TECH_SCORE",
+            "CLOSE_PRICE",
+            "RET_1M",
+            "RET_3M",
+            "RSI_14",
+            "DELIV_PER",
+            "DELIV_SPIKE_RATIO",
+            "FUNDAMENTALS_AVAILABLE",
+            "PROMOTER_HOLDING",
+            "PROMOTER_AS_OF",
+            "ROE",
+            "PE_RATIO",
+            "DEBT_TO_EQUITY",
+            "REV_GROWTH_YOY",
+            "EARNINGS_GROWTH_YOY",
+            "FUNDAMENTALS_COVERAGE_PCT"
+        },
+    }
+
+    frames = {
+        "sectors": sectors,
+        "industries": industries,
+        "stocks": stocks,
+    }
+
+    for name, frame in frames.items():
+        missing = sorted(required_columns[name] - set(frame.columns))
+
+        if missing:
+            raise ValueError(
+                f"{name.title()} data is missing required columns: "
+                + ", ".join(missing)
+                + ". Re-run scripts/compute_signals.py."
+            )
+
     return sectors, industries, stocks
 
 
@@ -43,23 +117,84 @@ def load_stock_history(symbol: str):
     return df
 
 
-if not os.path.exists(STOCKS_PARQUET):
-    st.error("Ranked data files not found. Please run `python scripts/compute_signals.py` first.")
+required_data_files = {
+    "EOD price history": EOD_PARQUET,
+    "ranked sectors": SECTORS_PARQUET,
+    "ranked industries": INDUSTRIES_PARQUET,
+    "ranked stocks": STOCKS_PARQUET,
+}
+
+missing_files = [
+    label
+    for label, path in required_data_files.items()
+    if not os.path.exists(path)
+]
+
+if missing_files:
+    st.error(
+        "Required data files are missing: "
+        + ", ".join(missing_files)
+        + ". Run the data backfill and pipeline scripts first."
+    )
     st.stop()
 
-sectors_df, industries_df, stocks_df = load_ranked_data()
-latest_date = pd.to_datetime(stocks_df["TRADE_DATE"].max()).strftime("%d %b %Y")
+try:
+    sectors_df, industries_df, stocks_df = load_ranked_data()
+except Exception as exc:
+    st.error(f"Could not load valid ranked data: {exc}")
+    st.stop()
 
 # --- HEADER ---
 st.title("🇮🇳 NSE Top-Down Sector, Industry & Stock Intelligence")
-st.caption(f"**Data Snapshot:** EOD {latest_date} | **Universe:** Nifty 500 | **Model:** 40% Fundamental + 40% Technical + 20% Sector/Industry Tailwind")
+
+latest_trade_date = pd.to_datetime(
+    stocks_df["TRADE_DATE"],
+    errors="coerce",
+).max()
+
+if pd.isna(latest_trade_date):
+    st.error("Ranked stock data has no valid trade date. Re-run the data pipeline.")
+    st.stop()
+
+latest_trade_date = pd.Timestamp(latest_trade_date).normalize()
+latest_date = latest_trade_date.strftime("%d %b %Y")
+
+today_ist = (
+    pd.Timestamp.now(tz="Asia/Kolkata")
+    .normalize()
+    .tz_localize(None)
+)
+
+weekdays_since_snapshot = len(
+    pd.bdate_range(
+        start=latest_trade_date + pd.Timedelta(days=1),
+        end=today_ist,
+    )
+)
+
+st.caption(
+    f"**Data Snapshot:** EOD {latest_date} | "
+    f"**Weekdays since snapshot:** {weekdays_since_snapshot} | "
+    "**Universe:** Nifty 500 | "
+    "**Model:** 40% Fundamental + 40% Technical + 20% Sector/Industry Tailwind"
+)
+
+if weekdays_since_snapshot > 5:
+    st.warning(
+        "This stock snapshot is more than five weekdays old. "
+        "Signals may be stale; check the latest data pipeline run."
+    )
 
 # --- SIDEBAR FILTERS ---
 st.sidebar.header("🎯 Screener Filters")
 selected_signals = st.sidebar.multiselect(
     "Signal Filter",
     options=stocks_df["SIGNAL"].unique().tolist(),
-    default=["🔥 STRONG BUY", "✅ ACCUMULATE"]
+    default=[
+    "🔥 STRONG BUY",
+    "✅ ACCUMULATE",
+    "👀 WATCHLIST — FUNDAMENTALS UNAVAILABLE",
+],
 )
 selected_sectors = st.sidebar.multiselect(
     "Sector Filter",
@@ -137,20 +272,36 @@ with tab1:
 # TAB 2: MASTER STOCK SCREENER
 # ==========================================
 with tab2:
+    missing_fundamentals = ~stocks_df["FUNDAMENTALS_AVAILABLE"]
+
     filtered = stocks_df[
-        (stocks_df["SIGNAL"].isin(selected_signals)) &
-        (stocks_df["SECTOR"].isin(selected_sectors)) &
-        (stocks_df["MASTER_SCORE"] >= min_master) &
-        (stocks_df["ROE"].fillna(0) >= min_roe) &
-        (stocks_df["DELIV_SPIKE_RATIO"].fillna(0) >= min_deliv_spike)
+        (stocks_df["SIGNAL"].isin(selected_signals))
+        & (
+            stocks_df["SECTOR"].isin(selected_sectors)
+            | missing_fundamentals
+        )
+        & (
+            (stocks_df["MASTER_SCORE"] >= min_master)
+            | missing_fundamentals
+        )
+        & (
+            (stocks_df["ROE"].fillna(0) >= min_roe)
+            | missing_fundamentals
+        )
+        & (
+            stocks_df["DELIV_SPIKE_RATIO"].fillna(0)
+            >= min_deliv_spike
+        )
     ].copy()
 
     st.subheader(f"Shortlisted High-Conviction Stocks ({len(filtered)} matches)")
     display_cols = [
-        "SYMBOL", "COMPANY_NAME", "SECTOR", "NSE_INDUSTRY", "SIGNAL",
+        "SYMBOL", "COMPANY_NAME", "SECTOR", "NSE_INDUSTRY",
+        "FUNDAMENTALS_AVAILABLE", "PROMOTER_HOLDING", "PROMOTER_AS_OF", "SIGNAL",
         "MASTER_SCORE", "FUND_SCORE", "TECH_SCORE", "CLOSE_PRICE",
         "RET_1M", "RET_3M", "RSI_14", "DELIV_PER", "DELIV_SPIKE_RATIO",
-        "ROE", "PE_RATIO", "DEBT_TO_EQUITY", "REV_GROWTH_YOY", "EARNINGS_GROWTH_YOY"
+        "ROE", "PE_RATIO", "DEBT_TO_EQUITY", "REV_GROWTH_YOY",
+        "EARNINGS_GROWTH_YOY", "FUNDAMENTALS_COVERAGE_PCT",
     ]
     st.dataframe(filtered[display_cols], use_container_width=True, hide_index=True, height=600)
 

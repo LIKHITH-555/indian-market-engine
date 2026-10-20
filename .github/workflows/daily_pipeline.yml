@@ -29,12 +29,23 @@ jobs:
         env:
           TZ: 'Asia/Kolkata'
         run: |
-          python scripts/fetch_eod.py
-          if [ "$(date +%u)" -eq 5 ]; then
-            echo "Friday detected — refreshing weekly fundamentals..."
-            python scripts/fetch_fundamentals.py
+          if python scripts/fetch_eod.py; then
+            if [ "$(date +%u)" -eq 5 ]; then
+              echo "Friday detected — refreshing weekly fundamentals..."
+              python scripts/fetch_fundamentals.py
+            fi
+
+            python scripts/compute_signals.py
+          else
+            status=$?
+
+            if [ "$status" -eq 78 ]; then
+              echo "NSE holiday — skipping fundamentals refresh and signal scoring."
+              exit 0
+            fi
+
+            exit "$status"
           fi
-          python scripts/compute_signals.py
 
       - name: Commit Updated Parquet Files
         run: |

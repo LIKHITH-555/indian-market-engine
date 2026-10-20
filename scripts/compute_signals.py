@@ -2,6 +2,7 @@ import os
 import duckdb
 import numpy as np
 import pandas as pd
+import tempfile
 
 DATA_DIR = "data"
 EOD_PARQUET = os.path.join(DATA_DIR, "eod_stocks.parquet")
@@ -13,14 +14,35 @@ OUT_STOCKS = os.path.join(DATA_DIR, "ranked_stocks.parquet")
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Calculates Wilder's 14-day RSI."""
+    """Calculate Wilder's RSI, including all-gain, all-loss, and flat periods."""
     delta = series.diff()
     gain = delta.clip(lower=0)
-    loss = -1 * delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return (100 - (100 / (1 + rs))).fillna(50).round(2)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        min_periods=period,
+        adjust=False,
+    ).mean()
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        min_periods=period,
+        adjust=False,
+    ).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    all_gain = (avg_loss == 0) & (avg_gain > 0)
+    all_loss = (avg_gain == 0) & (avg_loss > 0)
+    no_change = (avg_gain == 0) & (avg_loss == 0)
+
+    rsi = rsi.mask(all_gain, 100)
+    rsi = rsi.mask(all_loss, 0)
+    rsi = rsi.mask(no_change, 50)
+
+    # Use neutral RSI during the initial warm-up period.
+    return rsi.fillna(50).round(2)
 
 
 def load_and_calculate_technicals() -> pd.DataFrame:
@@ -73,43 +95,173 @@ def load_and_calculate_technicals() -> pd.DataFrame:
 
 
 def score_fundamentals(df: pd.DataFrame) -> pd.Series:
-    """Calculates a 0-100 Fundamental Quality Score including Balance Sheet & Cash Flow audits."""
+    """Score available fundamental metrics and record metric coverage."""
     score = pd.Series(0.0, index=df.index)
-    is_financial = df["SECTOR"].astype(str).str.contains("Financial|Bank", case=False, na=False)
+    available_points = pd.Series(0.0, index=df.index)
 
-    # 1. Capital Efficiency (Max 25 pts)
-    roe = df["ROE"].fillna(0)
-    roa = df["ROA"].fillna(0)
-    score += np.where(roe >= 20, 15, np.where(roe >= 15, 10, np.where(roe >= 10, 5, 0)))
-    score += np.where(
-        is_financial,
-        np.where(roa >= 1.5, 10, np.where(roa >= 1.0, 6, 0)),
-        np.where(df["OPERATING_MARGIN"].fillna(0) >= 18, 10, np.where(df["OPERATING_MARGIN"].fillna(0) >= 12, 6, 0))
+    def add_component(valid, points, weight: float) -> None:
+        valid = valid.fillna(False).astype(bool)
+        points = pd.Series(points, index=df.index, dtype="float64")
+        score.loc[valid] += points.loc[valid]
+        available_points.loc[valid] += weight
+
+    sector_known = df["SECTOR"].notna()
+    is_financial = df["SECTOR"].astype("string").str.contains(
+        "Financial|Bank",
+        case=False,
+        na=False,
     )
 
-    # 2. Earnings & Revenue Statement Growth (Max 30 pts)
-    rev_g = df["REV_GROWTH_YOY"].fillna(0)
-    eps_g = df["EARNINGS_GROWTH_YOY"].fillna(0)
-    consistent_rev = df["CONSISTENT_REVENUE_GROWTH"].fillna(False)
-    
-    score += np.where(consistent_rev, 15, np.where(rev_g >= 12, 10, 0))
-    score += np.where(eps_g >= 25, 15, np.where(eps_g >= 15, 10, np.where(eps_g > 5, 5, 0)))
+    # 1. Capital efficiency: ROE (15 points), then ROA or operating
+    # margin depending on whether the company is financial (10 points).
+    roe = df["ROE"]
+    roe_points = np.select(
+        [
+            roe >= 20,
+            roe >= 15,
+            roe >= 10,
+        ],
+        [15, 10, 5],
+        default=0,
+    )
+    add_component(roe.notna(), roe_points, 15)
 
-    # 3. Balance Sheet Solvency & Cash Flow Audit (Max 25 pts)
-    dte = df["DEBT_TO_EQUITY"].fillna(100)
-    interest_cov = df["INTEREST_COVERAGE"].fillna(0)
-    cfo_pos = df["CFO_POSITIVE_YEARS"].fillna(0)
+    secondary_metric = pd.Series(np.nan, index=df.index, dtype="float64")
+    secondary_metric.loc[is_financial] = df.loc[is_financial, "ROA"]
+    secondary_metric.loc[~is_financial] = df.loc[
+        ~is_financial,
+        "OPERATING_MARGIN",
+    ]
 
-    score += np.where(is_financial, 10, np.where((dte <= 30) & (interest_cov >= 4.0), 10, np.where(dte <= 70, 5, 0)))
-    score += np.where(cfo_pos >= 2, 15, np.where(cfo_pos == 1, 8, 0))
+    secondary_points = pd.Series(0.0, index=df.index)
+    financial_rows = is_financial & secondary_metric.notna()
+    nonfinancial_rows = ~is_financial & secondary_metric.notna()
 
-    # 4. Valuation & Institutional Skin-in-the-Game (Max 20 pts)
-    pe = df["PE_RATIO"].fillna(999)
-    score += np.where((pe > 0) & (pe <= 28), 10, np.where((pe > 28) & (pe <= 45), 5, 0))
-    strong_hands = df["PROMOTER_HOLDING"].fillna(0) + df["INSTITUTIONAL_HOLDING"].fillna(0)
-    score += np.where(strong_hands >= 65, 10, np.where(strong_hands >= 50, 6, 2))
+    secondary_points.loc[financial_rows] = np.select(
+        [
+            secondary_metric.loc[financial_rows] >= 1.5,
+            secondary_metric.loc[financial_rows] >= 1.0,
+        ],
+        [10, 6],
+        default=0,
+    )
+    secondary_points.loc[nonfinancial_rows] = np.select(
+        [
+            secondary_metric.loc[nonfinancial_rows] >= 18,
+            secondary_metric.loc[nonfinancial_rows] >= 12,
+        ],
+        [10, 6],
+        default=0,
+    )
 
-    return score.clip(0, 100).round(1)
+    add_component(
+        sector_known & secondary_metric.notna(),
+        secondary_points,
+        10,
+    )
+
+    # 2. Revenue and earnings growth.
+    revenue_growth = df["REV_GROWTH_YOY"]
+    consistent_growth = df["CONSISTENT_REVENUE_GROWTH"]
+    revenue_component_available = (
+        revenue_growth.notna() | consistent_growth.notna()
+    )
+    revenue_points = np.where(
+        consistent_growth.fillna(False).astype(bool),
+        15,
+        np.where(revenue_growth.fillna(-np.inf) >= 12, 10, 0),
+    )
+    add_component(revenue_component_available, revenue_points, 15)
+
+    earnings_growth = df["EARNINGS_GROWTH_YOY"]
+    earnings_points = np.select(
+        [
+            earnings_growth >= 25,
+            earnings_growth >= 15,
+            earnings_growth > 5,
+        ],
+        [15, 10, 5],
+        default=0,
+    )
+    add_component(earnings_growth.notna(), earnings_points, 15)
+
+    # 3. Balance sheet and operating cash flow.
+    debt_to_equity = df["DEBT_TO_EQUITY"]
+    interest_coverage = df["INTEREST_COVERAGE"]
+
+    # For financial companies, retain the original sector-specific
+    # treatment. For other companies, require both metrics.
+    solvency_available = sector_known & (
+        is_financial
+        | (debt_to_equity.notna() & interest_coverage.notna())
+    )
+
+    solvency_points = pd.Series(0.0, index=df.index)
+    solvency_points.loc[is_financial] = 10
+
+    nonfinancial_solvency = (
+        ~is_financial
+        & debt_to_equity.notna()
+        & interest_coverage.notna()
+    )
+    solvency_points.loc[nonfinancial_solvency] = np.where(
+        (debt_to_equity.loc[nonfinancial_solvency] <= 30)
+        & (interest_coverage.loc[nonfinancial_solvency] >= 4.0),
+        10,
+        np.where(
+            debt_to_equity.loc[nonfinancial_solvency] <= 70,
+            5,
+            0,
+        ),
+    )
+    add_component(solvency_available, solvency_points, 10)
+
+    cfo_years = df["CFO_POSITIVE_YEARS"]
+    cfo_points = np.select(
+        [
+            cfo_years >= 2,
+            cfo_years == 1,
+        ],
+        [15, 8],
+        default=0,
+    )
+    add_component(cfo_years.notna(), cfo_points, 15)
+
+    # 4. Valuation and reported institutional ownership.
+    pe_ratio = df["PE_RATIO"]
+    pe_points = np.select(
+        [
+            (pe_ratio > 0) & (pe_ratio <= 28),
+            (pe_ratio > 28) & (pe_ratio <= 45),
+        ],
+        [10, 5],
+        default=0,
+    )
+    add_component(pe_ratio.notna(), pe_points, 10)
+
+    institutional_holding = df["INSTITUTIONAL_HOLDING"]
+    institutional_points = np.select(
+        [
+            institutional_holding >= 50,
+            institutional_holding >= 30,
+        ],
+        [10, 6],
+        default=2,
+    )
+    add_component(
+        institutional_holding.notna(),
+        institutional_points,
+        10,
+    )
+
+    df["FUNDAMENTALS_COVERAGE_PCT"] = available_points.round(1)
+
+    # Normalize across available components, but require at least 60%
+    # of the possible points to be supported by reported data.
+    normalized_score = (score / available_points.replace(0, np.nan)) * 100
+    normalized_score = normalized_score.where(available_points >= 60)
+
+    return normalized_score.round(1)
 
 
 def score_technicals(df: pd.DataFrame) -> pd.Series:
@@ -204,9 +356,13 @@ def run_engine():
     fund_df = con.execute(f"SELECT * FROM '{FUND_PARQUET}'").df()
 
     print("[2/4] Merging Fundamental & Technical datasets...")
-    merged = pd.merge(latest_tech, fund_df, on="SYMBOL", how="inner")
+    merged = pd.merge(latest_tech, fund_df, on="SYMBOL", how="left")
+    merged["FUNDAMENTALS_AVAILABLE"] = merged["COMPANY_NAME"].notna()
 
     merged["FUND_SCORE"] = score_fundamentals(merged)
+    merged["FUNDAMENTALS_AVAILABLE"] = (
+        merged["FUNDAMENTALS_COVERAGE_PCT"] >= 60
+    )
     merged["TECH_SCORE"] = score_technicals(merged)
 
     print("[3/4] Ranking Sectors & Industries (Relative Rotation + Market Breadth)...")
@@ -239,14 +395,54 @@ def run_engine():
             np.where(merged["CLOSE_PRICE"] < merged["SMA_200"], "⚠️ AVOID / WEAK", "👀 WATCHLIST")
         )
     )
+    merged.loc[
+        ~merged["FUNDAMENTALS_AVAILABLE"],
+        "SIGNAL",
+    ] = "👀 WATCHLIST — FUNDAMENTALS UNAVAILABLE"
 
     merged = merged.sort_values("MASTER_SCORE", ascending=False).reset_index(drop=True)
 
-    # Save outputs to Parquet
-    print("[4/4] Saving ranked tables & printing executive summary...")
-    for table_df, path in [(sector_ranks, OUT_SECTORS), (industry_ranks, OUT_INDUSTRIES), (merged, OUT_STOCKS)]:
-        con.register("tmp_view", table_df)
-        con.execute(f"COPY tmp_view TO '{path}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+    # Save outputs atomically so an interrupted write does not leave
+    # a partially written Parquet file.
+    print("\n[4/4] Saving ranked tables & printing executive summary...")
+
+    for table_df, path in [
+        (sector_ranks, OUT_SECTORS),
+        (industry_ranks, OUT_INDUSTRIES),
+        (merged, OUT_STOCKS),
+    ]:
+        output_dir = os.path.dirname(path) or "."
+        temp_path = None
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".parquet",
+                prefix="ranked-",
+                dir=output_dir,
+                delete=False,
+            ) as temp_file:
+                temp_path = temp_file.name
+
+            # DuckDB must create the Parquet file itself.
+            os.remove(temp_path)
+
+            con.register("tmp_view", table_df)
+            try:
+                sql_temp_path = temp_path.replace("'", "''")
+                con.execute(
+                    f"COPY tmp_view TO '{sql_temp_path}' "
+                    "(FORMAT PARQUET, COMPRESSION ZSTD)"
+                )
+            finally:
+                con.unregister("tmp_view")
+
+            # Replace the existing file only after the new file is complete.
+            os.replace(temp_path, path)
+            temp_path = None
+
+        finally:
+            if temp_path is not None and os.path.exists(temp_path):
+                os.remove(temp_path)
 
     # --- PRINT TERMINAL REPORT ---
     print("\n" + "=" * 85)

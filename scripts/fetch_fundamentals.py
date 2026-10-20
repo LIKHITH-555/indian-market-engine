@@ -8,6 +8,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 import tempfile
+import numpy as np
 
 DATA_DIR = "data"
 FUND_PARQUET = os.path.join(DATA_DIR, "fundamentals.parquet")
